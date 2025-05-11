@@ -1,0 +1,53 @@
+<!-- src/app/components/chatbot/chatbot.component.html -->
+<div>
+  <h2>Test Chatbot API</h2>
+
+  <div *ngIf="backendStatus" style="background-color: #f0f0f0; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd;">
+    <h4>Statut du Backend (Brut) :</h4>
+    <pre>{{ backendStatus | json }}</pre>
+  </div>
+
+  <div style="margin-bottom: 15px;">
+    <input type="text"
+           [(ngModel)]="userQuestion"
+           (keyup.enter)="askQuestion()"
+           placeholder="Posez votre question ici..."
+           [disabled]="isLoading"
+           style="padding: 8px; width: 70%; margin-right: 10px;">
+    <button (click)="askQuestion()" [disabled]="isLoading || !userQuestion.trim()" style="padding: 8px 15px;">
+      {{ isLoading ? 'Envoi...' : 'Envoyer' }}
+    </button>
+  </div>
+
+  <div *ngIf="errorMessage" style="color: red; margin-bottom: 15px; border: 1px solid red; padding: 10px;">
+    <strong>Erreur :</strong> {{ errorMessage }}
+  </div>
+
+  <div *ngIf="botResponse" style="border: 1px solid #ccc; padding: 15px; background-color: #f9f9f9;">
+    <h4>Réponse du Bot :</h4>
+    <p><strong>Question posée :</strong> {{ botResponse.question }}</p>
+    <p><strong>Réponse :</strong> {{ botResponse.answer }}</p>
+
+    <div *ngIf="botResponse.mode">
+        <p><strong>Mode :</strong> {{ botResponse.mode }}</p>
+    </div>
+
+    <div *ngIf="botResponse.context_provided_to_llm && botResponse.context_provided_to_llm !== 'N/A'">
+      <p><strong>Contexte fourni au LLM (RAG) :</strong></p>
+      <pre style="white-space: pre-wrap; background-color: #eee; padding: 5px;">{{ botResponse.context_provided_to_llm }}</pre>
+    </div>
+
+    <div *ngIf="botResponse.sources && botResponse.sources.length > 0">
+      <p><strong>Sources :</strong></p>
+      <ul>
+        <li *ngFor="let source of botResponse.sources">
+          {{ source.source_file }} (Page: {{ source.page }}, Score: {{ source.score }})
+        </li>
+      </ul>
+    </div>
+  </div>
+
+   <div *ngIf="isLoading && !botResponse && !errorMessage" style="margin-top: 15px;">
+    <p>Chargement de la réponse...</p>
+  </div>
+</div>

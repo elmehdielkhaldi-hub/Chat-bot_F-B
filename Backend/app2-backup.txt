@@ -1,0 +1,477 @@
+import os
+from getpass import getpass
+from flask import Flask, render_template, request
+
+# --- LangChain Specific Imports ---
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings # NOUVEL IMPORT
+from langchain_chroma import Chroma # NOUVEL IMPORT
+from langchain_groq import ChatGroq
+from flask_cors import CORS
+
+# --- dotenv pour charger les variables d'environnement (BONNE PRATIQUE) ---
+from dotenv import load_dotenv
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+app.secret_key = os.urandom(24)
+
+# --- Global variables for RAG components ---
+all_loaded_docs_global = []
+chunks_global = []
+embeddingModel_global = None
+dbVector_global = None
+llm_global = None
+rag_pipeline_ready_global = False
+initialization_error_message = None
+loaded_pdf_filenames_global = [] # <--- NOUVELLE VARIABLE GLOBALE
+
+# --- Configuration ---
+PDF_FOLDER = "content/"
+CHROMA_PERSIST_DIR = "dbVector"
+HF_EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+GROQ_MODEL_NAME = "llama3-8b-8192"
+
+# --- RAG Helper Functions (inchangées) ---
+# ... (votre code pour search_similarity_global et generate_response_based_on_context_global reste ici) ...
+def search_similarity_global(question: str, k: int = 4) -> tuple[str, list[str]]:
+    if dbVector_global is None:
+        app.logger.error("dbVector_global is not initialized for search_similarity_global.")
+        return "", []
+    app.logger.info(f"[*] Recherche de similarité pour '{question}' (top {k} documents)...")
+    try:
+        similar_docs = dbVector_global.similarity_search_with_score(question, k=k)
+        if not similar_docs:
+            app.logger.info("[!] Aucun document similaire trouvé.")
+            return "", []
+        content_list = [doc.page_content for doc, score in similar_docs]
+        sources_list = [
+            f"Source: {doc.metadata.get('source_file', 'N/A')}, Page: {doc.metadata.get('page', 'N/A')}, Score: {score:.4f}"
+            for doc, score in similar_docs
+        ]
+        concatenated_texts = "\n\n---\n\n".join(content_list)
+        app.logger.info(f"[*]   -> {len(similar_docs)} documents trouvés et leur contenu concaténé.")
+        return concatenated_texts, sources_list
+    except Exception as e:
+        app.logger.error(f"[!] ERREUR pendant la recherche de similarité : {e}")
+        app.logger.exception("Traceback de la recherche de similarité:")
+        return "", []
+
+def generate_response_based_on_context_global(question: str, k_context: int = 4) -> tuple[str, str]:
+    global initialization_error_message # Allow modification
+    if llm_global is None:
+        app.logger.error("llm_global is not initialized for generate_response_based_on_context_global.")
+        return "L'instance du modèle de langage n'est pas disponible.", ""
+    if dbVector_global is None:
+        # This can happen if PDFs were found but failed to process into a DB
+        app.logger.error("dbVector_global is not initialized (perhaps no documents were loaded or processed).")
+        # Check if there was an initialization error related to docs
+        if initialization_error_message and "PDF" in initialization_error_message.upper():
+             return f"La base de données vectorielle n'est pas disponible. Erreur initiale: {initialization_error_message}", ""
+        return "La base de données vectorielle n'est pas disponible (aucun document chargé/indexé).", ""
+
+
+    app.logger.info(f"\n[*] Préparation de la réponse pour la question : '{question}'")
+    similar_context, sources = search_similarity_global(question, k=k_context)
+
+    if not similar_context:
+        app.logger.info("[!] Aucun contexte pertinent trouvé pour cette question.")
+        return "Je n'ai trouvé aucune information pertinente dans les documents fournis pour répondre à cette question.", "Aucun contexte trouvé."
+
+    prompt_text = f"""INSTRUCTIONS STRICTES:
+1. Répondez à la question ci-dessous en utilisant EXCLUSIVEMENT les informations présentes dans le 'CONTEXTE' fourni.
+2. Ne faites AUCUNE supposition. N'ajoutez AUCUNE information externe non présente dans le CONTEXTE.
+3. Si la réponse ne se trouve PAS dans le CONTEXTE, répondez littéralement : "L'information demandée n'est pas disponible dans le contexte fourni."
+4. Soyez concis et factuel.
+5. Si possible, citez vos sources en vous basant sur les métadonnées des documents du contexte.
+
+CONTEXTE:
+--- début du contexte ---
+{similar_context}
+--- fin du contexte ---
+
+QUESTION:
+{question}
+
+RÉPONSE FACTUELLE (basée uniquement sur le contexte):"""
+
+    app.logger.info("[*] Invocation du LLM avec le contexte et les instructions...")
+    try:
+        response = llm_global.invoke(prompt_text)
+        if hasattr(response, 'content'):
+            final_answer = response.content
+        else:
+            app.logger.warning("[!] Attribut '.content' non trouvé dans la réponse LLM, utilisation de str().")
+            final_answer = str(response)
+        app.logger.info("[*] Réponse LLM reçue.")
+        debug_context_str = "Contexte utilisé:\n" + similar_context + "\n\n--- Sources Détaillées ---\n" + "\n".join(sources)
+        return final_answer.strip(), debug_context_str
+    except Exception as e:
+        app.logger.error(f"[!] ERREUR lors de l'invocation du LLM ({type(e).__name__}): {e}")
+        app.logger.exception("Traceback de l'invocation LLM:")
+        return "Désolé, une erreur technique est survenue lors de la génération de la réponse.", similar_context
+
+
+# --- RAG Pipeline Initialization Function ---
+def initialize_rag_pipeline():
+    global all_loaded_docs_global, chunks_global, embeddingModel_global
+    global dbVector_global, llm_global, rag_pipeline_ready_global, initialization_error_message
+    global loaded_pdf_filenames_global # <--- N'oubliez pas de déclarer global ici aussi
+
+    # Réinitialisation
+    all_loaded_docs_global = []
+    chunks_global = []
+    embeddingModel_global = None
+    dbVector_global = None
+    llm_global = None
+    rag_pipeline_ready_global = False
+    initialization_error_message = None
+    loaded_pdf_filenames_global = [] # <--- Réinitialiser ici aussi
+
+    app.logger.info("--- Initialisation du pipeline RAG ---")
+
+    # 0. API Key
+    # ... (votre code pour la clé API reste ici) ...
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    if not groq_api_key:
+        app.logger.warning("[!] Clé API Groq non trouvée dans les variables d'environnement (GROQ_API_KEY).")
+        if os.isatty(0) and os.isatty(1): # Check if stdin and stdout are ttys
+            try:
+                groq_api_key = getpass("🔑 Veuillez entrer votre clé API Groq (ne sera pas affichée) : ")
+                if not groq_api_key: # User just pressed enter
+                    initialization_error_message = "Clé API Groq non fournie interactivement. Définissez GROQ_API_KEY."
+                    app.logger.error(initialization_error_message)
+                    return
+            except RuntimeError: # Happens if not in a real terminal (e.g. piped input)
+                initialization_error_message = "Clé API Groq non fournie et impossible de la demander interactivement. Définissez GROQ_API_KEY."
+                app.logger.error(initialization_error_message)
+                return
+            except EOFError: # Can happen in some non-interactive environments
+                initialization_error_message = "Clé API Groq non fournie (EOF lors de la tentative de lecture interactive). Définissez GROQ_API_KEY."
+                app.logger.error(initialization_error_message)
+                return
+        else:
+            initialization_error_message = "Clé API Groq non fournie et environnement non interactif. Définissez GROQ_API_KEY."
+            app.logger.error(initialization_error_message)
+            return
+    else:
+        app.logger.info("✅ Clé API Groq trouvée dans les variables d'environnement.")
+
+
+    # 1. PDF Loading
+    app.logger.info(f"[*] Étape 1: Chargement des PDF depuis '{PDF_FOLDER}'")
+    os.makedirs(PDF_FOLDER, exist_ok=True)
+
+    try:
+        pdf_files = [f for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")]
+    except FileNotFoundError:
+        initialization_error_message = f"[!] ERREUR : Le dossier '{PDF_FOLDER}' n'a pas été trouvé. Assurez-vous que le chemin est correct."
+        app.logger.error(initialization_error_message)
+        pdf_files = []
+
+    if not pdf_files:
+        app.logger.warning(f"[!] Aucun fichier PDF trouvé dans '{PDF_FOLDER}'. Le RAG fonctionnera sans documents spécifiques.")
+    else:
+        app.logger.info(f"[*] Fichiers PDF trouvés à traiter : {pdf_files}")
+        for pdf_file in pdf_files:
+            file_path = os.path.join(PDF_FOLDER, pdf_file)
+            app.logger.info(f"[*] Chargement du document : {pdf_file} ...")
+            try:
+                reader = PyPDFLoader(file_path)
+                pages_du_document = reader.load()
+
+                for page in pages_du_document:
+                    page.metadata["source_file"] = pdf_file
+
+                all_loaded_docs_global.extend(pages_du_document)
+                # Ajout du nom de fichier à la liste des PDF chargés avec succès
+                if pdf_file not in loaded_pdf_filenames_global: # Évite les doublons si un fichier est listé plusieurs fois
+                    loaded_pdf_filenames_global.append(pdf_file)
+                app.logger.info(f"[*]   -> Chargé {len(pages_du_document)} page(s) depuis '{pdf_file}'.")
+            except Exception as e:
+                app.logger.error(f"[!] ERREUR lors du chargement de '{pdf_file}': {e}")
+                app.logger.error(f"[!] Ce fichier sera ignoré.")
+
+    if not all_loaded_docs_global and pdf_files:
+        initialization_error_message = "Des fichiers PDF étaient présents mais aucune page n'a pu être chargée. Vérifiez les fichiers et les logs."
+        app.logger.error(initialization_error_message)
+    elif all_loaded_docs_global:
+        app.logger.info(f"\n[*] Chargement terminé. Total de {len(all_loaded_docs_global)} pages chargées depuis {len(loaded_pdf_filenames_global)} fichier(s) unique(s).")
+        app.logger.info(f"[*] Fichiers PDF chargés avec succès : {loaded_pdf_filenames_global}")
+
+
+    # 2. Text Splitting
+    # ... (votre code pour Text Splitting reste ici) ...
+    app.logger.info(f"[*] Étape 2: Découpage du texte")
+    if all_loaded_docs_global:
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        app.logger.info(f"[*] Découpage des {len(all_loaded_docs_global)} pages chargées en chunks...")
+        try:
+            chunks_global = text_splitter.split_documents(all_loaded_docs_global)
+            app.logger.info(f"[*]   -> Découpage réussi. {len(chunks_global)} chunks ont été créés.")
+            if chunks_global:
+                app.logger.debug(f"[*]   -> Métadonnées du premier chunk : {chunks_global[0].metadata}")
+                app.logger.debug(f"[*]   -> Métadonnées du dernier chunk (si >1) : {chunks_global[-1].metadata if len(chunks_global)>1 else 'N/A'}")
+            elif all_loaded_docs_global: # Docs chargés mais 0 chunks (ex: PDF vides ou contenu non extractible)
+                 app.logger.warning("[!]   -> Aucun chunk créé à partir des documents chargés. Vérifiez le contenu des PDF.")
+                 initialization_error_message = (initialization_error_message or "") + \
+                                                " Documents chargés mais aucun chunk créé (contenu PDF peut-être vide ou non extractible). "
+
+        except Exception as e:
+            error_msg = f"[!] ERREUR critique lors du découpage : {e}"
+            initialization_error_message = (initialization_error_message or "") + error_msg
+            app.logger.error(error_msg)
+            app.logger.exception("Traceback du text splitting:")
+            # On ne return pas forcément, le LLM seul pourrait fonctionner
+    else:
+        app.logger.info("[!] Aucun document chargé, donc pas de découpage de texte.")
+
+    # 3. Embedding Model
+    # ... (votre code pour Embedding Model reste ici) ...
+    app.logger.info(f"[*] Étape 3: Initialisation du modèle d'embedding")
+    if chunks_global: # On a besoin de chunks pour justifier l'embedding model pour Chroma
+        app.logger.info(f"[*] Initialisation de HuggingFaceEmbeddings : {HF_EMBEDDING_MODEL_NAME}")
+        try:
+            embeddingModel_global = HuggingFaceEmbeddings(
+                model_name=HF_EMBEDDING_MODEL_NAME,
+                model_kwargs={'device': 'cpu'} # ou 'cuda' si GPU disponible et configuré
+            )
+            _ = embeddingModel_global.embed_query("Test d'embedding.") # Test rapide
+            app.logger.info(f"✅ Modèle HuggingFace '{HF_EMBEDDING_MODEL_NAME}' initialisé.")
+        except Exception as e:
+            error_msg = f"[!] ERREUR Embedding Model : {e}"
+            initialization_error_message = (initialization_error_message or "") + error_msg
+            app.logger.error(error_msg)
+            app.logger.exception("Traceback de l'init Embedding Model:")
+            # Si l'embedding échoue, Chroma ne fonctionnera pas, donc pas de RAG.
+            # On ne return pas forcément, LLM seul.
+    elif all_loaded_docs_global: # Docs chargés mais pas de chunks (ex: PDF vides)
+        app.logger.warning("[!] Documents chargés mais aucun chunk créé. Initialisation Embedding/Chroma sautée.")
+    else:
+        app.logger.info("[!] Pas de chunks, init embedding model sautée (non nécessaire si pas de RAG).")
+
+    # 4. Vector Store (Chroma)
+    # ... (votre code pour Vector Store reste ici) ...
+    app.logger.info(f"[*] Étape 4: Initialisation du Vector Store (Chroma)")
+    if chunks_global and embeddingModel_global:
+        os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+        app.logger.info(f"[*] Vérification/création du dossier de persistance Chroma DB : {os.path.abspath(CHROMA_PERSIST_DIR)}")
+
+        try:
+            needs_rebuild = False
+            # Vérifier si le répertoire de persistance existe ET n'est pas vide
+            # `any(os.scandir(CHROMA_PERSIST_DIR))` est plus fiable que juste `os.path.exists` pour un dossier "vide"
+            chroma_dir_exists_and_not_empty = os.path.exists(CHROMA_PERSIST_DIR) and any(True for _ in os.scandir(CHROMA_PERSIST_DIR))
+
+            if chroma_dir_exists_and_not_empty:
+                app.logger.info(f"[*] Base Chroma existante trouvée. Chargement depuis {CHROMA_PERSIST_DIR}...")
+                dbVector_global = Chroma(
+                    persist_directory=CHROMA_PERSIST_DIR,
+                    embedding_function=embeddingModel_global
+                )
+                # Vérifier si la collection est vide après le chargement (peut arriver si des fichiers .parquet sont là mais la DB est corrompue/vide)
+                if dbVector_global._collection.count() == 0:
+                    app.logger.warning("[!] Base Chroma chargée mais la collection est vide. Forçage de la reconstruction.")
+                    needs_rebuild = True # Forcer la reconstruction si la collection est vide
+                else:
+                    current_db_count = dbVector_global._collection.count()
+                    app.logger.info(f"✅ Base Chroma chargée. Contient {current_db_count} documents.")
+                    if current_db_count != len(chunks_global):
+                        app.logger.warning(f"[*] DISCREPANCE: DB existante ({current_db_count} chunks) vs Chunks actuels ({len(chunks_global)}). Reconstruction nécessaire.")
+                        needs_rebuild = True
+                    else:
+                        app.logger.info("[*] Vérification de la cohérence des sources des chunks...")
+                        db_sources_metadata = dbVector_global._collection.get(include=["metadatas"])['metadatas']
+                        if db_sources_metadata is not None:
+                            db_source_files = set(meta.get('source_file') for meta in db_sources_metadata if meta and meta.get('source_file'))
+                            current_source_files = set(chunk.metadata.get('source_file') for chunk in chunks_global if chunk.metadata.get('source_file'))
+                            if db_source_files != current_source_files:
+                                app.logger.warning(f"[*] DISCREPANCE des fichiers sources: DB ({db_source_files}) vs Actuels ({current_source_files}). Reconstruction nécessaire.")
+                                needs_rebuild = True
+                            else:
+                                app.logger.info("✅ Cohérence des sources des chunks vérifiée.")
+                        else: # La collection est vide ou métadonnées non récupérables
+                            app.logger.warning("[*] Métadonnées de la collection Chroma non récupérables ou vides après chargement. Reconstruction nécessaire.")
+                            needs_rebuild = True
+
+                if needs_rebuild:
+                    app.logger.info(f"[*] Reconstruction de la base Chroma. Suppression des anciens chunks...")
+                    try:
+                        # Vider la collection existante. La méthode la plus sûre peut varier.
+                        # dbVector_global._collection.delete() # Supprime tous les items, mais peut être lent
+                        # Une approche plus radicale serait de supprimer le dossier et de recréer.
+                        # Pour l'instant, essayons de supprimer les IDs s'ils existent.
+                        all_ids = dbVector_global._collection.get(include=[])['ids']
+                        if all_ids:
+                            dbVector_global._collection.delete(ids=all_ids)
+                            app.logger.info(f"{len(all_ids)} anciens chunks supprimés de la collection.")
+                        
+                        # Si la suppression des IDs a vidé la collection, ou si elle était vide au départ
+                        app.logger.info(f"[*] Ajout de {len(chunks_global)} nouveaux chunks à Chroma...")
+                        dbVector_global.add_documents(chunks_global) # Chroma gère les IDs automatiquement
+                        dbVector_global.persist()
+                        app.logger.info(f"✅ Chunks ré-ajoutés et base persistée. Nouvelle taille: {dbVector_global._collection.count()}")
+                    except Exception as e_rebuild:
+                        error_msg = f"Erreur lors de la reconstruction de la base Chroma: {e_rebuild}"
+                        initialization_error_message = (initialization_error_message or "") + error_msg
+                        app.logger.error(error_msg)
+                        app.logger.exception("Traceback de la reconstruction Chroma:")
+                        dbVector_global = None # Invalider dbVector_global en cas d'échec de reconstruction
+                        # On ne return pas, LLM seul peut fonctionner
+            else: # Créer une nouvelle DB si le dossier n'existe pas ou est vide
+                app.logger.info(f"[*] Aucune base Chroma existante ou dossier vide. Création d'une nouvelle base dans '{CHROMA_PERSIST_DIR}' avec {len(chunks_global)} chunks...")
+                dbVector_global = Chroma.from_documents(
+                    documents=chunks_global,
+                    embedding=embeddingModel_global,
+                    persist_directory=CHROMA_PERSIST_DIR
+                )
+                dbVector_global.persist()
+                app.logger.info(f"✅ Nouvelle base Chroma créée et persistée. Contient {dbVector_global._collection.count()} documents.")
+
+        except Exception as e:
+            error_msg = f"[!] ERREUR Chroma DB: {e}"
+            initialization_error_message = (initialization_error_message or "") + error_msg
+            app.logger.error(error_msg)
+            app.logger.exception("Traceback complet de l'erreur Chroma DB:")
+            dbVector_global = None # Invalider en cas d'erreur
+            # On ne return pas, LLM seul
+    elif chunks_global and not embeddingModel_global:
+        app.logger.warning("[!] Chunks présents mais Embedding Model non initialisé. Chroma DB ne peut être créée.")
+        initialization_error_message = (initialization_error_message or "") + \
+                                       " Modèle d'embedding non initialisé, impossible de créer la base vectorielle. "
+    elif not chunks_global and all_loaded_docs_global:
+         app.logger.warning("[!] Documents chargés mais aucun chunk créé. Vector Store (Chroma) sauté.")
+    else: # Pas de chunks
+        app.logger.info("[!] Pas de chunks, donc pas de Vector Store (Chroma) à initialiser.")
+
+
+    # 5. LLM (ChatGroq)
+    # ... (votre code pour LLM reste ici) ...
+    app.logger.info(f"[*] Étape 5: Initialisation du LLM (ChatGroq)")
+    if groq_api_key: # Vérifie si la clé a été obtenue
+        app.logger.info(f"[*] Initialisation LLM ChatGroq ({GROQ_MODEL_NAME})...")
+        try:
+            llm_global = ChatGroq(
+                model_name=GROQ_MODEL_NAME,
+                api_key=groq_api_key,
+                temperature=0.1 # Gardez une température basse pour la factualité
+            )
+            # Test rapide pour s'assurer que le LLM est fonctionnel
+            _ = llm_global.invoke("Bonjour")
+            app.logger.info(f"✅ LLM ChatGroq initialisé.")
+        except Exception as e:
+            error_msg = f"[!] ERREUR LLM ChatGroq : {e}"
+            initialization_error_message = (initialization_error_message or "") + error_msg
+            app.logger.error(error_msg)
+            app.logger.exception("Traceback de l'init LLM:")
+            llm_global = None # Invalider
+            return # Si le LLM échoue, l'application est probablement inutile
+    else:
+        if not initialization_error_message: # Si une autre erreur n'a pas déjà été définie
+             initialization_error_message = (initialization_error_message or "") + \
+                                            "[!] Clé API Groq non obtenue. LLM non initialisé."
+        app.logger.error(initialization_error_message)
+        return # LLM est essentiel
+
+
+    # Statut final du pipeline
+    # ... (votre code pour le statut final reste ici) ...
+    if llm_global and dbVector_global and chunks_global: # RAG complet
+        rag_pipeline_ready_global = True
+        app.logger.info("✅ --- Pipeline RAG initialisé avec succès (LLM + Documents) ! ---")
+    elif llm_global and not dbVector_global : # LLM seul
+        rag_pipeline_ready_global = True # On considère le LLM seul comme "prêt" pour une fonctionnalité de base
+        app.logger.warning("✅ --- Pipeline initialisé (LLM seul, pas de documents RAG ou erreur lors de leur traitement). ---")
+        if not initialization_error_message and not all_loaded_docs_global and not pdf_files:
+             app.logger.info("Aucun PDF trouvé, fonctionnement en mode LLM seul.")
+        elif not initialization_error_message and (not all_loaded_docs_global or not chunks_global or not dbVector_global):
+             initialization_error_message = (initialization_error_message or "") + \
+                                            "Problème lors du traitement des documents pour le RAG. Fonctionnement en LLM seul."
+
+    else: # Échec critique
+        rag_pipeline_ready_global = False
+        app.logger.error("--- Pipeline RAG n'a pas pu être initialisé. Vérifiez les erreurs. ---")
+        if not initialization_error_message: # Message d'erreur générique si aucun autre n'est défini
+             initialization_error_message = "Erreur inconnue et critique lors de l'initialisation du RAG et/ou du LLM."
+        app.logger.error(f"Message d'erreur final de l'initialisation: {initialization_error_message}")
+
+
+# --- Flask Routes ---
+@app.route('/', methods=['GET'])
+def index():
+    status_msg = "Système non initialisé ou erreur."
+    current_error_to_display = initialization_error_message
+
+    if rag_pipeline_ready_global:
+        if dbVector_global and chunks_global:
+            status_msg = "Système RAG prêt (LLM + Documents). Posez votre question."
+        else:
+            status_msg = "LLM prêt (pas de documents RAG chargés ou erreur lors de leur traitement). Vous pouvez poser des questions générales."
+    else:
+        if not current_error_to_display:
+             current_error_to_display = "Le système RAG n'a pas pu démarrer. Vérifiez les logs du serveur."
+
+    return render_template('index.html',
+                           rag_status=status_msg,
+                           error_message=current_error_to_display,
+                           rag_ready=rag_pipeline_ready_global,
+                           db_ready=bool(dbVector_global and chunks_global),
+                           loaded_pdfs=loaded_pdf_filenames_global # <--- PASSER LA LISTE AU TEMPLATE
+                           )
+
+@app.route('/api/chat', methods=['POST'])
+def ask():
+    # ... (votre code pour /ask reste ici, mais vous pourriez aussi passer loaded_pdf_filenames_global si nécessaire)
+    question = request.form.get('question', '').strip()
+    answer = ""
+    context_used = ""
+    current_error_to_display = initialization_error_message # Récupère l'erreur d'init si elle existe
+
+    if not rag_pipeline_ready_global:
+        return render_template('index.html',
+                               question=question,
+                               error_message=current_error_to_display or "Le système RAG n'est pas prêt. Vérifiez les logs.",
+                               rag_ready=rag_pipeline_ready_global,
+                               db_ready=False,
+                               loaded_pdfs=loaded_pdf_filenames_global) # Passer aussi ici pour re-render la page correctement
+
+    if not question:
+        answer = "Veuillez entrer une question."
+    elif not dbVector_global or not chunks_global: # Mode LLM seul (soit pas de docs, soit erreur traitement docs)
+        app.logger.info(f"[*] Mode LLM seul. Question: {question}")
+        try:
+            response = llm_global.invoke(question) # llm_global doit être prêt si rag_pipeline_ready_global est True
+            answer = response.content if hasattr(response, 'content') else str(response)
+            context_used = "Aucun contexte RAG utilisé (mode LLM seul)."
+        except Exception as e:
+            app.logger.error(f"Erreur LLM seul lors de la question: {e}")
+            answer = "Désolé, erreur lors de la communication avec le LLM."
+            app.logger.exception("Traceback de l'erreur LLM seul:")
+    else: # Mode RAG normal (dbVector_global et chunks_global sont prêts)
+        answer, context_used = generate_response_based_on_context_global(question, k_context=3)
+
+    # Déterminer le statut pour le template
+    status_msg = "Système non initialisé ou erreur."
+    if rag_pipeline_ready_global:
+        if dbVector_global and chunks_global:
+            status_msg = "Système RAG prêt (LLM + Documents). Posez votre question."
+        else:
+            status_msg = "LLM prêt (pas de documents RAG). Vous pouvez poser des questions générales."
+
+
+    return render_template('index.html',
+                           question=question,
+                           answer=answer,
+                           context=context_used,
+                           rag_status=status_msg,
+                           error_message=None,
+                           rag_ready=rag_pipeline_ready_global,
+                           db_ready=bool(dbVector_global and chunks_global),
+                           loaded_pdfs=loaded_pdf_filenames_global) # Passer aussi ici
+
+# --- Application Startup ---
+if __name__ == '__main__':
+    initialize_rag_pipeline()
+    app.run(debug=True, host='0.0.0.0', port=5001)

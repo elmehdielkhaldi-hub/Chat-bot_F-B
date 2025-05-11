@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chatbot RAG PDF</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Chatbot RAG avec PDF</h1>
+
+        <div class="status-section">
+            <h2>Statut du Système</h2>
+            {% if rag_status %}
+                <p class="status {{ 'ready' if rag_ready else 'not-ready' }}">{{ rag_status }}</p>
+            {% endif %}
+            {% if error_message %}
+                <p class="error-message"><strong>Erreur d'initialisation :</strong> {{ error_message }}</p>
+            {% endif %}
+        </div>
+
+        <!-- NOUVELLE SECTION POUR AFFICHER LES PDF CHARGÉS -->
+        {% if loaded_pdfs %}
+        <div class="loaded-pdfs-section">
+            <h3>Documents PDF chargés avec succès :</h3>
+            <ul>
+                {% for pdf_name in loaded_pdfs %}
+                <li>{{ pdf_name }}</li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% elif rag_ready and not db_ready %} <!-- Affiché si le LLM est prêt mais pas la DB (donc pas de docs) -->
+        <div class="loaded-pdfs-section">
+             <p>Aucun document PDF n'a été chargé ou traité avec succès pour le RAG.</p>
+        </div>
+        {% endif %}
+        <!-- FIN DE LA NOUVELLE SECTION -->
+
+
+        <div class="chat-section">
+            <form action="{{ url_for('ask') }}" method="post">
+                <input name="question" placeholder="Posez votre question ici..." rows="3" required>{{ question if question }}</input>
+                <button type="submit">Envoyer</button>
+            </form>
+
+            {% if answer %}
+            <div class="response-section">
+                <h2>Réponse :</h2>
+                <div class="answer">
+                    <pre>{{ answer }}</pre>
+                </div>
+
+                {% if context %}
+                <details class="context-details">
+                    <summary>Afficher/Masquer le contexte utilisé</summary>
+                    <pre>{{ context }}</pre>
+                </details>
+                {% endif %}
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</body>
+</html>

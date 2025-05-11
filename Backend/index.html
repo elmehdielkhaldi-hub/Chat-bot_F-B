@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test RAG avec Flask</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        .container {
+            max-width: 700px;
+            margin: auto;
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        textarea {
+            width: 95%; /* Un peu moins pour le padding */
+            padding: 10px;
+            margin-bottom: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 1em;
+            min-height: 60px;
+        }
+        button {
+            display: block;
+            width: 100%;
+            padding: 10px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1em;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .response-section, .context-section {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #e9ecef;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+        }
+        h2, h3 {
+            margin-top: 0;
+        }
+        pre {
+            white-space: pre-wrap;       /* Permet au texte de passer à la ligne */
+            word-wrap: break-word;       /* Coupe les mots longs */
+            background: #f8f9fa;
+            padding: 10px;
+            border: 1px solid #dee2e6;
+            border-radius: 3px;
+            font-family: "Courier New", Courier, monospace;
+        }
+        .status-message {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .status-ready {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status-error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Interrogez vos Documents PDF</h1>
+
+        <!-- Affichage des messages d'état du système RAG -->
+        {% if rag_status %}
+            <p class="status-message status-ready">{{ rag_status }}</p>
+        {% elif error_message %}
+            <p class="status-message status-error">{{ error_message }}</p>
+        {% endif %}
+
+        <!-- Formulaire pour poser une question -->
+        <form action="{{ url_for('ask') }}" method="post">
+            <textarea name="question" placeholder="Posez votre question ici...">{{ question if question }}</textarea>
+            <button type="submit" {% if not rag_ready %}disabled{% endif %}>
+                Obtenir une Réponse
+            </button>
+        </form>
+
+        <!-- Section pour afficher la réponse du LLM -->
+        {% if answer %}
+        <div class="response-section">
+            <h2>Réponse :</h2>
+            <pre>{{ answer }}</pre>
+        </div>
+        {% endif %}
+
+        <!-- Section optionnelle pour afficher le contexte (utile pour le débogage) -->
+        {% if context and answer != "Veuillez entrer une question." and "Je n'ai trouvé aucune information pertinente" not in answer and "L'information demandée n'est pas disponible" not in answer and "Désolé, une erreur technique" not in answer %}
+        <div class="context-section">
+            <h3>Contexte Utilisé (pour débogage) :</h3>
+            <pre>{{ context }}</pre>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
