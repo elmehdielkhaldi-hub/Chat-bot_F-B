@@ -1,3 +1,6 @@
+# Required libraries can be installed with:
+# pip install flask flask-cors langchain-community langchain-huggingface langchain-chroma langchain-groq python-dotenv
+
 import os
 import re # Pour le nettoyage de texte
 import shutil # Pour la suppression de dossier
